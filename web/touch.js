@@ -78,7 +78,7 @@
         send({action:'down', ...gesture.point});
       }
       gesture.lastPoint = point;
-      if (gesture.dragging && performance.now() - lastMove >= 35) {
+      if (gesture.dragging && performance.now() - lastMove >= 8) {
         send({action:'move', ...point}); lastMove = performance.now();
       }
     });

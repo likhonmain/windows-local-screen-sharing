@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 from ctypes import wintypes
 import hmac
@@ -10,7 +11,9 @@ import ipaddress
 import json
 import secrets
 import signal
+import socket
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -19,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 from windows_input import MouseController
+from fast_capture import FastCapture
+from realtime import Realtime
 
 import mss
 import qrcode
@@ -26,13 +31,15 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent
 PRESETS = {
+    "speed120": {"label": "120 fps · 720p speed", "width": 1280, "quality": 70, "fps": 120},
+    "speed60": {"label": "60 fps · 1080p smooth", "width": 1920, "quality": 80, "fps": 60},
     "eco": {"label": "Data saver · 854px", "width": 854, "quality": 45, "fps": 12},
     "fast": {"label": "Fast · 1024px", "width": 1024, "quality": 55, "fps": 20},
     "balanced": {"label": "Balanced · 1600px", "width": 1600, "quality": 75, "fps": 20},
-    "smooth": {"label": "Smooth · 1080p / 30 fps", "width": 1920, "quality": 82, "fps": 30},
+    "smooth": {"label": "Smooth · 1080p", "width": 1920, "quality": 82, "fps": 30},
     "sharp": {"label": "Sharp text · 1440p", "width": 2560, "quality": 92, "fps": 15},
     "ultra": {"label": "Ultra · 4K", "width": 3840, "quality": 98, "fps": 15},
-    "native": {"label": "Native · JPEG 100%", "width": 0, "quality": 100, "fps": 15},
+    "native": {"label": "Native · full resolution", "width": 0, "quality": 100, "fps": 15},
     "lossless": {"label": "Lossless · native PNG", "width": 0, "quality": 100, "fps": 8, "format": "PNG"},
 }
 
@@ -89,17 +96,26 @@ class Mirror:
         self.enabled = True
         self.touch_enabled = True
         self.viewers = 0
+        self.video_viewers = 0
+        self.video_frame = None
+        self.fps_limit = 60
+        self.presets = PRESETS
+        self.capture_backend = 'Starting'
+        self.encoder_name = 'Not connected'
+        self.capture_times = deque(maxlen=240)
+        self.encoded_times = deque(maxlen=240)
         self.frame = b""
         self.frame_type = "image/jpeg"
         self.sequence = 0
         self.last_frame_at = 0.0
         self.actual_fps = 0.0
         self.error = ""
-        self.preset = "balanced"
+        self.preset = "speed60"
         self.monitor = 1
         with mss.MSS() as capture:
             self.monitors = [dict(item) for item in capture.monitors]
         self.mouse = MouseController() if input_sender is None else MouseController(sender=input_sender)
+        self.rtc = Realtime(self)
         self.worker = threading.Thread(target=self.capture, name="Screen capture", daemon=True)
         self.worker.start()
 
@@ -110,6 +126,13 @@ class Mirror:
                 "preset": self.preset, "monitor": self.monitor,
                 "touch": self.touch_enabled,
                 "presets": PRESETS,
+                "target_fps": self.target_fps,
+                "fps_limit": self.fps_limit,
+                "video_viewers": self.video_viewers,
+                "capture_backend": self.capture_backend,
+                "encoder": self.encoder_name,
+                "encoded_fps": self.measured_fps(self.encoded_times),
+                "realtime": True,
                 "fps": round(self.actual_fps, 1) if self.viewers and self.enabled else 0,
                 "error": self.error,
                 "monitors": [{"id": i, "width": m["width"], "height": m["height"]}
@@ -118,10 +141,20 @@ class Mirror:
             if admin:
                 result.update(pair_url=self.pair_url, ip=self.ip, port=self.port,
                               subnet=str(self.network))
-            return result
+        return result
+
+    @staticmethod
+    def measured_fps(samples):
+        now = time.monotonic()
+        recent = [stamp for stamp in list(samples) if now - stamp < 2]
+        return round((len(recent) - 1) / (recent[-1] - recent[0]), 1) if len(recent) > 1 else 0
+
+    @property
+    def target_fps(self):
+        return min(self.fps_limit, 8) if self.preset == 'lossless' else self.fps_limit
 
     def update(self, payload, admin):
-        allowed = {"preset", "monitor", "sharing", "touch"} if admin else {"preset"}
+        allowed = {"preset", "monitor", "sharing", "touch", "fps"} if admin else {"preset", "fps"}
         if not payload or set(payload) - allowed:
             raise ValueError("Unsupported setting")
         if "preset" in payload and payload["preset"] not in PRESETS:
@@ -133,18 +166,27 @@ class Mirror:
             raise ValueError("Sharing must be true or false")
         if "touch" in payload and type(payload["touch"]) is not bool:
             raise ValueError("Touch must be true or false")
+        if 'fps' in payload and (type(payload['fps']) is not int or payload['fps'] not in {30, 60, 90, 120}):
+            raise ValueError('Frame rate must be 30, 60, 90, or 120')
         with self.condition:
             if 'monitor' in payload or payload.get('sharing') is False or payload.get('touch') is False:
                 self.mouse.release()
             if "preset" in payload:
                 self.preset = payload["preset"]
                 self.frame = b""
+                self.video_frame = None
+                if self.preset in {'speed60', 'speed120'}:
+                    self.fps_limit = PRESETS[self.preset]['fps']
+            if 'fps' in payload:
+                self.fps_limit = payload['fps']
             if "monitor" in payload:
                 self.monitor = payload["monitor"]
                 self.frame = b""
+                self.video_frame = None
             if "sharing" in payload:
                 self.enabled = payload["sharing"]
                 self.frame = b""
+                self.video_frame = None
             if "touch" in payload:
                 self.touch_enabled = payload["touch"]
             self.condition.notify_all()
@@ -162,7 +204,16 @@ class Mirror:
         try:
             # MSS capture handles belong to the thread that uses them.
             with mss.MSS() as capture:
+                source = FastCapture(capture)
+                last_jpeg = 0
                 while not self.stopping:
+                    with self.condition:
+                        active = self.enabled and self.viewers > 0
+                    # Native capture shutdown can wait for callbacks. Keep it outside
+                    # the application lock so peer cleanup and input remain responsive.
+                    if not active:
+                        source.close()
+                        source.selection = None
                     with self.condition:
                         self.condition.wait_for(
                             lambda: self.stopping or (self.enabled and self.viewers > 0))
@@ -170,32 +221,44 @@ class Mirror:
                             break
                         monitor, preset = self.monitor, self.preset
                         config = PRESETS[preset]
+                        target_fps = self.target_fps
+                        image_viewers = self.viewers - self.video_viewers
                     start = time.monotonic()
                     try:
-                        shot = capture.grab(self.monitors[monitor])
-                        picture = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                        draw_pointer(picture, self.monitors[monitor])
-                        if config["width"] and picture.width > config["width"]:
-                            height = max(1, round(picture.height * config["width"] / picture.width))
-                            picture = picture.resize((config["width"], height), Image.Resampling.BILINEAR)
-                        output = io.BytesIO()
+                        raw, backend = source.read(self.monitors[monitor], target_fps)
+                        if raw is None:
+                            time.sleep(0.005)
+                            continue
+                        self.capture_backend = backend
+                        output = None
                         image_format = config.get('format', 'JPEG')
-                        if image_format == 'PNG':
-                            picture.save(output, format='PNG', compress_level=1)
-                        else:
-                            # Preserve full chroma resolution for crisp text in the high-quality modes.
-                            picture.save(output, format='JPEG', quality=config['quality'],
-                                         subsampling=0 if config['quality'] >= 90 else 2)
+                        # Real-time video skips image compression entirely. Keep compatibility images
+                        # at at most 60 fps to avoid flooding TCP with full-size screenshots.
+                        if image_viewers and time.monotonic() - last_jpeg >= 1 / min(target_fps, 60):
+                            picture = Image.frombytes('RGB', (raw.shape[1], raw.shape[0]), raw.tobytes(), 'raw', 'BGRX')
+                            if backend != 'Windows Graphics Capture':
+                                draw_pointer(picture, self.monitors[monitor])
+                            if config['width'] and picture.width > config['width']:
+                                height = max(1, round(picture.height * config['width'] / picture.width))
+                                picture = picture.resize((config['width'], height), Image.Resampling.BILINEAR)
+                            output = io.BytesIO()
+                            if image_format == 'PNG':
+                                picture.save(output, format='PNG', compress_level=1)
+                            else:
+                                picture.save(output, format='JPEG', quality=config['quality'],
+                                             subsampling=0 if config['quality'] >= 90 else 2)
+                            last_jpeg = time.monotonic()
                         with self.condition:
                             # Discard a frame if sharing stopped or the selection changed mid-capture.
                             if self.enabled and monitor == self.monitor and preset == self.preset:
-                                self.frame = output.getvalue()
-                                self.frame_type = 'image/png' if image_format == 'PNG' else 'image/jpeg'
-                                self.sequence += 1
+                                self.video_frame = raw
+                                if output is not None:
+                                    self.frame = output.getvalue()
+                                    self.frame_type = 'image/png' if image_format == 'PNG' else 'image/jpeg'
+                                    self.sequence += 1
                                 now = time.monotonic()
-                                if self.last_frame_at:
-                                    elapsed = now - self.last_frame_at
-                                    self.actual_fps = 1 / elapsed if elapsed else 0
+                                self.capture_times.append(now)
+                                self.actual_fps = self.measured_fps(self.capture_times)
                                 self.last_frame_at = now
                                 self.error = ""
                                 self.condition.notify_all()
@@ -203,9 +266,10 @@ class Mirror:
                         with self.condition:
                             self.error = f"Capture unavailable: {exc}"
                         time.sleep(1)
-                    delay = max(0, 1 / config["fps"] - (time.monotonic() - start))
+                    delay = max(0, 1 / target_fps - (time.monotonic() - start))
                     if delay:
                         time.sleep(delay)
+                source.close()
         except Exception as exc:
             with self.condition:
                 self.error = f"Could not initialize screen capture: {exc}"
@@ -216,8 +280,10 @@ class Mirror:
         with self.condition:
             self.stopping = True
             self.frame = b""
+            self.video_frame = None
             self.condition.notify_all()
         self.worker.join(timeout=3)
+        self.rtc.close()
 
 
 class Server(ThreadingHTTPServer):
@@ -276,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
     def reply(self, status, body, content_type="text/plain; charset=utf-8", cookie=None):
         self.headers_for(status, content_type, len(body))
@@ -334,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.gate():
                 return
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 4096:
+            if not 0 < length <= (65536 if urlsplit(self.path).path == '/api/rtc/offer' else 4096):
                 self.reply(400, b"Invalid request size")
                 self.close_connection = True
                 return
@@ -357,6 +423,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/input' and not self.server.admin:
                 self.server.mirror.touch(payload)
                 self.json_reply(200, {"ok": True})
+            elif path == '/api/rtc/offer' and not self.server.admin:
+                self.json_reply(200, self.server.mirror.rtc.offer(payload, self.client_address[0]))
+            elif path == '/api/rtc/close' and not self.server.admin:
+                self.server.mirror.rtc.disconnect(payload.get('id'))
+                self.json_reply(200, {'ok':True})
             elif path == "/api/stop" and self.server.admin:
                 self.json_reply(200, {"ok": True})
                 self.server.mirror.stop_event.set()
@@ -370,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def stream(self):
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
         mirror = self.server.mirror
         with mirror.condition:
             if not mirror.enabled:
@@ -432,7 +505,7 @@ def main():
         runtime.mkdir(exist_ok=True)
         # This file contains network details only, never a pairing credential.
         (runtime / "network.json").write_text(json.dumps({"ip": mirror.ip, "subnet": str(mirror.network),
-                                                        "port": args.port}), encoding="utf-8")
+                                                        "port": args.port, "python":sys._base_executable}), encoding="utf-8")
         stop = mirror.stop_event
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())

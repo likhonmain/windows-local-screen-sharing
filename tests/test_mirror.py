@@ -52,6 +52,7 @@ class MirrorTests(unittest.TestCase):
     def test_authentication_and_control_isolation(self):
         self.assertEqual(self.request('/api/status')[0], 401)
         self.assertEqual(self.request('/stream')[0], 401)
+        self.assertEqual(self.request('/api/rtc/offer', {'type':'offer', 'sdp':'v=0'})[0], 401)
         self.assertEqual(self.request('/api/pair', {'token':'wrong'})[0], 401)
         cookie = self.pair()
         status, body, _ = self.request('/api/status', cookie=cookie)
@@ -59,6 +60,8 @@ class MirrorTests(unittest.TestCase):
         self.assertNotIn('pair_url', json.loads(body))
         self.assertEqual(self.request('/api/settings', {'sharing':False}, cookie=cookie)[0], 400)
         self.assertEqual(self.request('/qr.png', cookie=cookie)[0], 404)
+        self.assertEqual(self.request('/api/rtc/offer', {}, cookie=cookie)[0], 400)
+        self.assertEqual(self.request('/api/rtc/offer', {}, admin=True)[0], 404)
 
     def test_host_origin_and_invalid_input(self):
         self.assertEqual(self.request('/', extra={'Host':'attacker.example'})[0], 403)

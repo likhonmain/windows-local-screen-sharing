@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host 'Windows administrator permission is needed to allow this local connection through the firewall.'
-    Write-Host 'The rule allows TCP 8765 (or your configured port) only at your laptop hotspot IP, from its subnet.'
+    Write-Host 'This allows the page over TCP and the Python video stream over UDP, only on your hotspot subnet.'
     $taskArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
     $taskProcess = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList $taskArgs -Wait -PassThru
     if ($taskProcess.ExitCode -ne 0) { throw 'Firewall setup failed or administrator permission was declined.' }
@@ -22,4 +22,8 @@ if ($subnet -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') { throw 'Invalid hotspo
 # Only replace the dedicated rule created by this app.
 Get-NetFirewallRule -Name 'LocalScreenMirror-Hotspot' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -Name 'LocalScreenMirror-Hotspot' -DisplayName 'Local Screen Mirror - hotspot only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -LocalAddress $network.ip -RemoteAddress $subnet -Profile Any | Out-Null
+$pythonProgram = [string]$network.python
+if (-not $pythonProgram -or -not (Test-Path -LiteralPath $pythonProgram)) { throw 'Restart the updated mirror before enabling video access.' }
+Get-NetFirewallRule -Name 'LocalScreenMirror-Video' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -Name 'LocalScreenMirror-Video' -DisplayName 'Local Screen Mirror - local video' -Direction Inbound -Action Allow -Protocol UDP -Program $pythonProgram -LocalAddress $network.ip -RemoteAddress $subnet -Profile Any | Out-Null
 Write-Host 'The scoped hotspot firewall rule is ready.'

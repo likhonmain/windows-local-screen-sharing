@@ -14,16 +14,18 @@
     <section id="control" hidden>
       <div class="intro"><span class="eyebrow">YOUR SCREEN, A LITTLE CLOSER</span><h1>A second view.<br>Right in your hand.</h1><p>Keep your laptop on your phone’s hotspot.<br>Scan below with your OnePlus camera to start viewing.</p></div>
       <div class="pair-card"><img id="qr" alt="QR code to pair your phone"><div><span class="eyebrow">OPEN ON YOUR ONEPLUS</span><p id="address" class="address">Finding your hotspot address…</p><button id="copy">Copy pairing link</button><p class="hint">Chrome works best. Rotate your phone for a bigger view.</p></div></div>
-      <div class="controls"><label>Display<select id="monitor"></select></label><label>Picture quality<select id="controlQuality"></select></label><button id="sharing" class="primary">Pause sharing</button></div>
+      <div class="controls"><label>Display<select id="monitor"></select></label><label>Picture quality<select id="controlQuality"></select></label><label>Frame rate<select id="controlFps"><option value="30">30 fps</option><option value="60">60 fps</option><option value="90">90 fps</option><option value="120">120 fps · maximum</option></select></label><button id="sharing" class="primary">Pause sharing</button></div>
       <div class="touch-settings"><label><input type="checkbox" id="allowTouch" checked> Allow paired phone touch control</label><p class="hint">Turn this off anytime to make all phones view-only.</p></div>
       <p id="qualityInfo" class="hint"></p>
+      <p id="pipelineInfo" class="hint"></p>
       <button id="stopServer">Stop server</button>
-      <p class="help">Phone won’t connect? Run <strong>Enable-Hotspot-Access.cmd</strong> in the project folder and approve the Windows prompt, then scan again. Keep this mirror running.</p>
+      <p class="help">Run <strong>Enable-Hotspot-Access.cmd</strong> again after this upgrade to allow local video through Windows Firewall. Choose 60 fps for everyday use or 120 fps + the 720p speed preset for maximum responsiveness.</p>
     </section>
     <section id="viewer" hidden>
       <div class="viewer-top"><div><span class="eyebrow">LIVE FROM YOUR LAPTOP</span><h1>Your screen.</h1></div><button id="fullscreen">Fullscreen ↗</button></div>
-      <div id="stage" class="stage"><img id="screen" alt="Live laptop screen" draggable="false" hidden><div id="overlay"><span class="loader"></span><p id="message">Connecting to your laptop…</p></div></div>
-      <div class="viewer-controls"><button id="viewToggle" class="primary">Pause view</button><select id="viewerQuality" aria-label="Picture quality"></select><button id="touchToggle" aria-pressed="true">Touch on</button><button id="fit">Fill screen</button><button id="retry">Reconnect</button></div>
+      <div id="stage" class="stage"><video id="screenVideo" autoplay muted playsinline hidden></video><img id="screen" alt="Live laptop screen" draggable="false" hidden><div id="overlay"><span class="loader"></span><p id="message">Connecting to your laptop…</p></div></div>
+      <div class="viewer-controls"><button id="viewToggle" class="primary">Pause view</button><select id="viewerQuality" aria-label="Picture quality"></select><select id="viewerFps" aria-label="Frame rate"><option value="30">30 fps</option><option value="60">60 fps</option><option value="90">90 fps</option><option value="120">120 fps</option></select><button id="touchToggle" aria-pressed="true">Touch on</button><button id="fit">Fill screen</button><button id="retry">Reconnect</button><select id="transport" aria-label="Streaming mode"><option value="video">Realtime video</option><option value="image">Image compatibility</option></select></div>
+      <p id="videoStats" class="hint">Waiting for video…</p>
       <p class="hint">Tap to click · drag to move · hold to right-click · two fingers to scroll. Use Android Back to leave fullscreen. No audio.</p>
     </section>
     <footer><span id="status">Starting…</span><span>No cloud. No account. Just your hotspot.</span></footer>
