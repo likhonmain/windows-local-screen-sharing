@@ -12,7 +12,9 @@ class MirrorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         network = discover_network()
-        cls.mirror = Mirror(network['ip'], network['prefix'], 0, 0)
+        cls.inputs = []
+        cls.mirror = Mirror(network['ip'], network['prefix'], 0, 0,
+                            input_sender=lambda **event: cls.inputs.append(event))
         cls.viewer = Server((network['ip'], 0), cls.mirror)
         cls.admin = Server(('127.0.0.1', 0), cls.mirror, admin=True)
         cls.mirror.port = cls.viewer.server_port
@@ -65,6 +67,53 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.request('/api/settings', {'monitor':999}, admin=True)[0], 400)
         self.assertEqual(self.request('/api/settings', {'sharing':'yes'}, admin=True)[0], 400)
         self.assertEqual(self.request('/api/settings', {'preset':[]}, admin=True)[0], 400)
+
+    def test_touch_authentication_validation_and_laptop_switch(self):
+        event = {'action':'click', 'x':0.5, 'y':0.5, 'monitor':1}
+        self.assertEqual(self.request('/api/input', event)[0], 401)
+        cookie = self.pair()
+        self.assertEqual(self.request('/api/settings', {'touch':False}, cookie=cookie)[0], 400)
+        self.request('/api/settings', {'sharing':True, 'touch':True}, admin=True)
+        self.inputs.clear()
+        self.assertEqual(self.request('/api/input', event, cookie=cookie)[0], 200)
+        self.assertEqual([item['flags'] for item in self.inputs], [0xC001, 0x0002, 0x0004])
+        for invalid in ({**event, 'x':1.1}, {**event, 'y':True},
+                        {**event, 'x':float('nan')}, {**event, 'monitor':999},
+                        {**event, 'action':'run_command'},
+                        {**event, 'action':'scroll', 'delta':9999}):
+            self.assertEqual(self.request('/api/input', invalid, cookie=cookie)[0], 400)
+        self.assertEqual(self.request('/api/input', event, cookie=cookie,
+                                      extra={'Origin':'https://attacker.example'})[0], 403)
+        self.request('/api/input', {**event, 'action':'down'}, cookie=cookie)
+        self.assertTrue(self.mirror.mouse.pressed)
+        self.request('/api/settings', {'touch':False}, admin=True)
+        self.assertFalse(self.mirror.mouse.pressed)
+        self.assertEqual(self.request('/api/input', event, cookie=cookie)[0], 403)
+        self.assertEqual(self.request('/api/input', {'action':'release'}, cookie=cookie)[0], 200)
+        self.request('/api/settings', {'touch':True, 'sharing':False}, admin=True)
+        self.assertEqual(self.request('/api/input', event, cookie=cookie)[0], 403)
+        self.request('/api/settings', {'sharing':True}, admin=True)
+
+    def test_native_and_lossless_frames(self):
+        cookie = self.pair()
+        for preset, image_format, mime in [('native','JPEG', b'image/jpeg'), ('lossless','PNG', b'image/png')]:
+            self.request('/api/settings', {'sharing':True, 'preset':preset}, admin=True)
+            connection = http.client.HTTPConnection(self.mirror.ip, self.mirror.port, timeout=15)
+            connection.request('GET', '/stream', headers={'Cookie':cookie})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.readline(), b'--frame\r\n')
+            self.assertIn(mime, response.readline())
+            length = int(response.readline().decode().split(':')[1])
+            response.readline()
+            image = Image.open(io.BytesIO(response.read(length)))
+            image.load()
+            self.assertEqual(image.format, image_format)
+            monitor = self.mirror.monitors[1]
+            self.assertEqual(image.size, (monitor['width'], monitor['height']))
+            response.close()
+            connection.close()
+        self.request('/api/settings', {'preset':'balanced'}, admin=True)
 
     def test_live_frame_pause_quality_and_qr(self):
         cookie = self.pair()

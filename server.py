@@ -1,4 +1,4 @@
-"""Local, view-only desktop mirror. No external services or network dependencies."""
+"""Local desktop mirror with paired phone touch control. No external services."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+from windows_input import MouseController
 
 import mss
 import qrcode
@@ -25,9 +26,14 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent
 PRESETS = {
-    "fast": {"width": 1024, "quality": 55, "fps": 15},
-    "balanced": {"width": 1600, "quality": 75, "fps": 20},
-    "sharp": {"width": 2560, "quality": 88, "fps": 15},
+    "eco": {"label": "Data saver · 854px", "width": 854, "quality": 45, "fps": 12},
+    "fast": {"label": "Fast · 1024px", "width": 1024, "quality": 55, "fps": 20},
+    "balanced": {"label": "Balanced · 1600px", "width": 1600, "quality": 75, "fps": 20},
+    "smooth": {"label": "Smooth · 1080p / 30 fps", "width": 1920, "quality": 82, "fps": 30},
+    "sharp": {"label": "Sharp text · 1440p", "width": 2560, "quality": 92, "fps": 15},
+    "ultra": {"label": "Ultra · 4K", "width": 3840, "quality": 98, "fps": 15},
+    "native": {"label": "Native · JPEG 100%", "width": 0, "quality": 100, "fps": 15},
+    "lossless": {"label": "Lossless · native PNG", "width": 0, "quality": 100, "fps": 8, "format": "PNG"},
 }
 
 
@@ -68,7 +74,7 @@ def discover_network():
 
 
 class Mirror:
-    def __init__(self, ip, prefix, port, control_port):
+    def __init__(self, ip, prefix, port, control_port, input_sender=None):
         self.ip = ip
         self.network = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
         self.port = port
@@ -81,8 +87,10 @@ class Mirror:
         self.stopping = False
         self.stop_event = threading.Event()
         self.enabled = True
+        self.touch_enabled = True
         self.viewers = 0
         self.frame = b""
+        self.frame_type = "image/jpeg"
         self.sequence = 0
         self.last_frame_at = 0.0
         self.actual_fps = 0.0
@@ -91,6 +99,7 @@ class Mirror:
         self.monitor = 1
         with mss.MSS() as capture:
             self.monitors = [dict(item) for item in capture.monitors]
+        self.mouse = MouseController() if input_sender is None else MouseController(sender=input_sender)
         self.worker = threading.Thread(target=self.capture, name="Screen capture", daemon=True)
         self.worker.start()
 
@@ -99,6 +108,8 @@ class Mirror:
             result = {
                 "sharing": self.enabled, "viewers": self.viewers,
                 "preset": self.preset, "monitor": self.monitor,
+                "touch": self.touch_enabled,
+                "presets": PRESETS,
                 "fps": round(self.actual_fps, 1) if self.viewers and self.enabled else 0,
                 "error": self.error,
                 "monitors": [{"id": i, "width": m["width"], "height": m["height"]}
@@ -110,7 +121,7 @@ class Mirror:
             return result
 
     def update(self, payload, admin):
-        allowed = {"preset", "monitor", "sharing"} if admin else {"preset"}
+        allowed = {"preset", "monitor", "sharing", "touch"} if admin else {"preset"}
         if not payload or set(payload) - allowed:
             raise ValueError("Unsupported setting")
         if "preset" in payload and payload["preset"] not in PRESETS:
@@ -120,16 +131,32 @@ class Mirror:
             raise ValueError("Unknown display")
         if "sharing" in payload and type(payload["sharing"]) is not bool:
             raise ValueError("Sharing must be true or false")
+        if "touch" in payload and type(payload["touch"]) is not bool:
+            raise ValueError("Touch must be true or false")
         with self.condition:
+            if 'monitor' in payload or payload.get('sharing') is False or payload.get('touch') is False:
+                self.mouse.release()
             if "preset" in payload:
                 self.preset = payload["preset"]
+                self.frame = b""
             if "monitor" in payload:
                 self.monitor = payload["monitor"]
                 self.frame = b""
             if "sharing" in payload:
                 self.enabled = payload["sharing"]
                 self.frame = b""
+            if "touch" in payload:
+                self.touch_enabled = payload["touch"]
             self.condition.notify_all()
+
+    def touch(self, payload):
+        with self.condition:
+            if payload.get('action') != 'release':
+                if not self.enabled or not self.touch_enabled:
+                    raise PermissionError('Touch control is disabled on the laptop.')
+                if type(payload.get('monitor')) is not int or payload['monitor'] != self.monitor:
+                    raise ValueError('Display changed. Wait for the current display before touching.')
+            self.mouse.dispatch(payload, self.monitors[self.monitor], self.monitors[0])
 
     def capture(self):
         try:
@@ -148,15 +175,22 @@ class Mirror:
                         shot = capture.grab(self.monitors[monitor])
                         picture = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                         draw_pointer(picture, self.monitors[monitor])
-                        if picture.width > config["width"]:
+                        if config["width"] and picture.width > config["width"]:
                             height = max(1, round(picture.height * config["width"] / picture.width))
                             picture = picture.resize((config["width"], height), Image.Resampling.BILINEAR)
                         output = io.BytesIO()
-                        picture.save(output, format="JPEG", quality=config["quality"])
+                        image_format = config.get('format', 'JPEG')
+                        if image_format == 'PNG':
+                            picture.save(output, format='PNG', compress_level=1)
+                        else:
+                            # Preserve full chroma resolution for crisp text in the high-quality modes.
+                            picture.save(output, format='JPEG', quality=config['quality'],
+                                         subsampling=0 if config['quality'] >= 90 else 2)
                         with self.condition:
                             # Discard a frame if sharing stopped or the selection changed mid-capture.
                             if self.enabled and monitor == self.monitor and preset == self.preset:
                                 self.frame = output.getvalue()
+                                self.frame_type = 'image/png' if image_format == 'PNG' else 'image/jpeg'
                                 self.sequence += 1
                                 now = time.monotonic()
                                 if self.last_frame_at:
@@ -178,6 +212,7 @@ class Mirror:
                 self.condition.notify_all()
 
     def close(self):
+        self.mouse.close()
         with self.condition:
             self.stopping = True
             self.frame = b""
@@ -264,10 +299,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.gate():
             return
         path = urlsplit(self.path).path
-        if path in {"/", "/app.js", "/style.css"}:
+        if path in {"/", "/app.js", "/touch.js", "/style.css"}:
             name, kind = {
                 "/": ("index.html", "text/html; charset=utf-8"),
                 "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                "/touch.js": ("touch.js", "text/javascript; charset=utf-8"),
                 "/style.css": ("style.css", "text/css; charset=utf-8"),
             }[path]
             body = (ROOT / "web" / name).read_bytes()
@@ -318,6 +354,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/settings":
                 self.server.mirror.update(payload, self.server.admin)
                 self.json_reply(200, self.server.mirror.status(self.server.admin))
+            elif path == '/api/input' and not self.server.admin:
+                self.server.mirror.touch(payload)
+                self.json_reply(200, {"ok": True})
             elif path == "/api/stop" and self.server.admin:
                 self.json_reply(200, {"ok": True})
                 self.server.mirror.stop_event.set()
@@ -325,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(404, b"Not found")
         except (ValueError, TypeError) as exc:
             self.json_reply(400, {"error": str(exc)})
+        except PermissionError as exc:
+            self.json_reply(403, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -356,8 +397,8 @@ class Handler(BaseHTTPRequestHandler):
                         if mirror.error:
                             break
                         continue
-                    frame, sequence = mirror.frame, mirror.sequence
-                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                    frame, sequence, frame_type = mirror.frame, mirror.sequence, mirror.frame_type
+                self.wfile.write(b"--frame\r\nContent-Type: " + frame_type.encode() + b"\r\nContent-Length: " +
                                  str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -400,7 +441,7 @@ def main():
         print(f"\nLOCAL SCREEN MIRROR\nLaptop controls: {mirror.control_url}\nPhone address:   http://{mirror.ip}:{args.port}/\nAllowed network: {mirror.network}\n", flush=True)
         print("Scan the QR code in Laptop controls. Keep this window open. Ctrl+C stops sharing.\n"
               "If the phone cannot connect, run Enable-Hotspot-Access.cmd once.\n"
-              "Screen only: no audio or remote control. All stream traffic stays local.", flush=True)
+              "Touch control enabled for paired phones. No audio. All stream traffic stays local.", flush=True)
         if not args.no_browser:
             webbrowser.open(mirror.control_url)
         while not stop.wait(0.5):

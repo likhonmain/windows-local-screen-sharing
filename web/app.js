@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const control = document.body.dataset.role === 'control';
-let current, poll, paused = false, streaming = false, paired = control;
+let current, poll, paused = false, streaming = false, paired = control, touchEnabled = true, touchController;
 const screen = $('screen');
 function error(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
 async function api(path, payload) {
@@ -14,6 +14,7 @@ async function api(path, payload) {
 }
 function overlay(message) { $('message').textContent = message; $('overlay').hidden = false; }
 function stopView(message) {
+  touchController?.cancel();
   streaming = false; screen.removeAttribute('src'); screen.hidden = true; overlay(message);
 }
 function startView() {
@@ -22,7 +23,12 @@ function startView() {
   screen.src = `/stream?t=${Date.now()}`;
 }
 function render(state) {
+  if (current && (current.monitor !== state.monitor || !state.touch)) touchController?.cancel();
   current = state;
+  const quality = $(control ? 'controlQuality' : 'viewerQuality');
+  if (!quality.options.length) {
+    for (const [key, preset] of Object.entries(state.presets)) quality.add(new Option(preset.label, key));
+  }
   $('status').textContent = state.error ? 'Capture unavailable' : state.sharing
     ? `${state.viewers ? 'Live' : 'Ready'} · ${state.viewers} viewer${state.viewers === 1 ? '' : 's'}${state.fps ? ` · ${state.fps} fps` : ''}`
     : 'Sharing paused on laptop';
@@ -31,12 +37,19 @@ function render(state) {
     $('address').textContent = `http://${state.ip}:${state.port}`;
     $('controlQuality').value = state.preset;
     $('sharing').textContent = state.sharing ? 'Pause sharing' : 'Start sharing';
+    $('allowTouch').checked = state.touch;
+    const preset = state.presets[state.preset];
+    $('qualityInfo').textContent = `${preset.width ? `Up to ${preset.width}px wide` : 'Original display resolution'} · ${preset.format === 'PNG' ? 'Lossless PNG' : `JPEG ${preset.quality}%`} · target ${preset.fps} fps. Higher quality uses more local Wi-Fi bandwidth.`;
     if (!$('monitor').options.length) {
       for (const m of state.monitors) $('monitor').add(new Option(`Display ${m.id} · ${m.width} × ${m.height}`, m.id));
     }
     $('monitor').value = state.monitor;
   } else {
     $('viewerQuality').value = state.preset;
+    $('touchToggle').disabled = !state.touch;
+    $('touchToggle').textContent = !state.touch ? 'Touch blocked by laptop' : touchEnabled ? 'Touch on' : 'Touch off';
+    $('touchToggle').setAttribute('aria-pressed', String(state.touch && touchEnabled));
+    $('stage').classList.toggle('touch-active', state.touch && touchEnabled);
     if (!state.sharing) stopView('Sharing is paused on your laptop.');
     else if (state.error) stopView(state.error);
     else if (!paused) {
@@ -56,6 +69,7 @@ async function setting(payload) {
 }
 async function initialize() {
   $(control ? 'control' : 'viewer').hidden = false;
+  if (control) $('qr').src = '/qr.png';
   if (!control) {
     const token = location.hash.slice(1);
     history.replaceState(null, '', location.pathname);
@@ -82,6 +96,7 @@ $('stopServer').onclick = async () => {
   catch(e) { error(e.message); }
 };
 $('monitor').onchange = event => setting({monitor:Number(event.target.value)});
+$('allowTouch').onchange = event => setting({touch:event.target.checked});
 $('controlQuality').onchange = $('viewerQuality').onchange = event => setting({preset:event.target.value});
 $('viewToggle').onclick = () => {
   paused = !paused; $('viewToggle').textContent = paused ? 'Resume view' : 'Pause view';
@@ -91,17 +106,36 @@ screen.onload = () => { if(streaming) $('overlay').hidden = true; };
 screen.onerror = () => { streaming = false; overlay('Reconnecting…'); setTimeout(refresh, 1500); };
 $('retry').onclick = () => { if(!paired) { location.reload(); return; } stopView('Reconnecting…'); refresh(); };
 $('fit').onclick = () => { const fill = $('stage').classList.toggle('fill'); $('fit').textContent = fill ? 'Fit screen' : 'Fill screen'; };
-function immersive(active) { $('exitFullscreen').hidden = !active; document.body.classList.toggle('immersive', active); }
+function immersive(active) { document.body.classList.toggle('immersive', active); }
 $('fullscreen').onclick = async () => {
   const stage = $('stage');
   try { if (!stage.requestFullscreen) throw new Error('Fullscreen unavailable'); await stage.requestFullscreen(); immersive(true); }
-  catch { stage.classList.add('pseudo-fullscreen'); immersive(true); }
+  catch {
+    stage.classList.add('pseudo-fullscreen'); immersive(true);
+    history.pushState({mirrorFullscreen:true}, '', location.href);
+  }
 };
-$('exitFullscreen').onclick = () => {
-  if (document.fullscreenElement) document.exitFullscreen();
-  $('stage').classList.remove('pseudo-fullscreen'); immersive(false);
+window.addEventListener('popstate', () => { $('stage').classList.remove('pseudo-fullscreen'); immersive(false); });
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('stage').classList.contains('pseudo-fullscreen')) history.back();
+});
+$('touchToggle').onclick = () => {
+  touchController?.cancel(); touchEnabled = !touchEnabled; if(current) render(current);
 };
+if (!control) touchController = LocalTouch.attach($('stage'), screen, {
+  enabled:() => paired && streaming && !paused && !document.hidden && current?.sharing && current?.touch && touchEnabled && $('overlay').hidden,
+  monitor:() => current?.monitors.find(m => m.id === current.monitor) || {id:1, width:0, height:0},
+  send:payload => api('/api/input', payload),
+  error:e => error(e.message)
+});
 document.addEventListener('fullscreenchange', () => immersive(!!document.fullscreenElement));
 document.addEventListener('visibilitychange', () => { if(!control && document.hidden) stopView('Resume this tab to reconnect.'); if(!document.hidden) refresh(); });
-window.addEventListener('pagehide', () => { clearInterval(poll); if(!control) screen.removeAttribute('src'); });
+window.addEventListener('pagehide', () => {
+  clearInterval(poll);
+  if(!control) {
+    touchController?.cancel(); screen.removeAttribute('src');
+    fetch('/api/input', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'release'}), keepalive:true}).catch(() => {});
+  }
+});
 initialize().catch(e => error(e.message));
