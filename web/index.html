@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Local Mirror</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body data-role="__ROLE__">
+  <main>
+    <header><div class="brand"><span class="mark">◩</span><div>Local Mirror<small>Laptop → OnePlus</small></div></div><span class="badge">LOCAL WI-FI ONLY</span></header>
+    <section id="control" hidden>
+      <div class="intro"><span class="eyebrow">YOUR SCREEN, A LITTLE CLOSER</span><h1>A second view.<br>Right in your hand.</h1><p>Keep your laptop on your phone’s hotspot.<br>Scan below with your OnePlus camera to start viewing.</p></div>
+      <div class="pair-card"><img id="qr" src="/qr.png" alt="QR code to pair your phone"><div><span class="eyebrow">OPEN ON YOUR ONEPLUS</span><p id="address" class="address">Finding your hotspot address…</p><button id="copy">Copy pairing link</button><p class="hint">Chrome works best. Rotate your phone for a bigger view.</p></div></div>
+      <div class="controls"><label>Display<select id="monitor"></select></label><label>Picture quality<select id="controlQuality"><option value="fast">Fast · lower bandwidth</option><option value="balanced">Balanced · everyday use</option><option value="sharp">Sharp · reading text</option></select></label><button id="sharing" class="primary">Pause sharing</button></div>
+      <button id="stopServer">Stop server</button>
+      <p class="help">Phone won’t connect? Run <strong>Enable-Hotspot-Access.cmd</strong> in the project folder and approve the Windows prompt, then scan again. Keep this mirror running.</p>
+    </section>
+    <section id="viewer" hidden>
+      <div class="viewer-top"><div><span class="eyebrow">LIVE FROM YOUR LAPTOP</span><h1>Your screen.</h1></div><button id="fullscreen">Fullscreen ↗</button></div>
+      <div id="stage" class="stage"><img id="screen" alt="Live laptop screen" hidden><div id="overlay"><span class="loader"></span><p id="message">Connecting to your laptop…</p></div><button id="exitFullscreen" class="exit" hidden>Exit fullscreen</button></div>
+      <div class="viewer-controls"><button id="viewToggle" class="primary">Pause view</button><select id="viewerQuality" aria-label="Picture quality"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="sharp">Sharp text</option></select><button id="fit">Fill screen</button><button id="retry">Reconnect</button></div>
+      <p class="hint">Use landscape for a larger picture. Audio and touch control are not included.</p>
+    </section>
+    <footer><span id="status">Starting…</span><span>No cloud. No account. Just your hotspot.</span></footer>
+    <p id="error" class="error" hidden></p>
+  </main>
+</body>
+</html>
